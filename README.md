@@ -268,8 +268,40 @@ See [`.env.example`](.env.example) for the full list. Key variables:
 
 **Write path:** `POST /api/transactions/` → validate → atomic DB write → update pre-aggregated stats tables using `F()` expressions (no lost updates under concurrent writes).
 
-**Read path:** `build_snapshot()` reads only the small stats tables (~40 × 24 rows for hourly, one row per venue/date/item for items) — never the raw transaction history. This keeps reads fast regardless of daily transaction volume.
+**Read path:** `build_snapshot()` reads only the small stats tables (~40 × 24 rows for hourly, one row per venue/date/item for items)never the raw transaction history. This keeps reads fast regardless of daily transaction volume.
 
 **Alerts:** Computed as a pure function over a 4-hour sliding window. `sales_drop` fires when the last hour is below 50% of the hourly average of hours 1–4 ago. `void_spike` fires when (voids + refunds) exceed 15% of transactions, with a minimum volume guard.
 
 **Idempotency:** `transaction_id` has a unique DB constraint. POS retries are safe — duplicates are detected and not re-counted.
+
+---
+
+## Decisions I've made on Backend Design & Features
+
+**Pre-aggregate on write, not on read.**
+The `VenueHourlyStats` and `VenueItemStats` tables are updated atomically every time a transaction arrives. The dashboard read path only touches those small derived tables never the raw transaction history. This keeps reads fast and predictable regardless of how many transactions accumulate during the day.
+
+**`F()` expressions for stat increments.**
+Increments like `sale_count += 1` are executed in SQL (`UPDATE ... SET sale_count = sale_count + 1`) rather than read-modify-write in Python. This eliminates lost updates when multiple venues POST concurrently.
+
+**Idempotent ingest with a savepoint.**
+The unique constraint on `transaction_id` makes the endpoint safe to retry. The duplicate detection uses a nested `atomic()` (savepoint) so a duplicate `IntegrityError` doesn't poison the outer transaction a Django-specific requirement when using Postgres.
+
+**Two separate auth mechanisms.**
+POS machines are automated systems they don't log in. A shared `X-API-Key` (with `hmac.compare_digest` to prevent timing attacks) is the right pattern for machine-to-machine auth. Human ops users get DRF token auth with per-user revocation.
+
+---
+
+## What I'd Improve With More Time
+
+**Shared snapshot via Redis channel layer.**
+Currently each connected browser tab runs its own set of DB queries every 2 seconds. With a Redis-backed channel layer, one background task builds the snapshot and fans it out to all connected clients same DB load regardless of how many people are watching.
+
+**Refund item stats.**
+Currently refunds reduce `sales_total` in `VenueHourlyStats` but do not reduce individual item `qty` in `VenueItemStats`. Matching refunded items back to their original sale lines would give accurate item-level numbers.
+
+**Rate limiting on `/api/transactions/`.**
+A misbehaving or buggy POS could flood the ingest endpoint. Request rate limiting (e.g. via `django-ratelimit`) would protect the DB.
+
+**Pagination on venue and transaction endpoints.**
+With more data historical transactions, larger venue lists the API endpoints would need cursor-based pagination. The snapshot endpoint currently returns all 40 venues in one payload; at larger scale this should be paginated or filtered by region. The raw transaction history endpoint (not yet exposed) would definitely need pagination before it could be used in any reporting feature.
